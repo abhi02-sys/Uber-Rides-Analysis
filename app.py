@@ -4,605 +4,453 @@ import matplotlib.pyplot as plt
 from matplotlib.ticker import FuncFormatter
 
 st.set_page_config(
-    page_title="Uber Ride Analytics Dashboard",
+    page_title="Uber Ride Analytics: Why Bookings Don't Complete",
     page_icon="🚖",
     layout="wide"
 )
-df = pd.read_csv("Uber_Processed.csv")
-completed = df[df["Booking Status"]=="Completed"].copy()
+st.title("🚖 Uber Ride Analytics")
+BUSINESS_QUESTION = "Where, when and why do Uber bookings end up unsuccessful?"
+
+MONTHS = [
+    "January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December"
+]
+TIME_SLOTS = ["Morning", "Afternoon", "Evening", "Night"]
+
+# One colour per status, reused in every chart so the story stays consistent
+STATUS_COLORS = {
+    "Completed": "#2ca02c",
+    "Incomplete": "#d62728",
+    "No Driver Found": "#9467bd",
+    "Cancelled by Customer": "#1f77b4",
+    "Cancelled by Driver": "#ff7f0e",
+}
+STATUS_ORDER = list(STATUS_COLORS.keys())
+
+M_FMT = FuncFormatter(lambda x, pos: f"{x / 1_000_000:.1f} M")
+
+
+
+@st.cache_data
+def load_data():
+    data = pd.read_csv("Uber_Processed.csv")
+    data["Month"] = pd.Categorical(data["Month"], categories=MONTHS, ordered=True)
+    data["time_category"] = pd.Categorical(
+        data["time_category"], categories=TIME_SLOTS, ordered=True
+    )
+    data["is_failed"] = data["Booking Status"] != "Completed"
+    data["is_ndf"] = data["Booking Status"] == "No Driver Found"
+    return data
+
+
+df = load_data()
+completed = df[df["Booking Status"] == "Completed"].copy()
+failed = df[df["Booking Status"] != "Completed"].copy()
+
+# ------------------------------------------------------------------ #
+# KPIs
+# ------------------------------------------------------------------ #
+total_bookings = len(df)
+n_failed = len(failed)
+completion_rate = len(completed) / total_bookings * 100
+failure_rate = 100 - completion_rate
+
+total_revenue = completed["Booking Value"].sum()
+average_fare = completed["Booking Value"].mean()
+
+n_completed = len(completed)
+
+# ------------------------------------------------------------------ #
+# DERIVED TABLES
+# ------------------------------------------------------------------ #
+# Failure breakdown
+fail_breakdown = failed["Booking Status"].value_counts()
+fail_share = fail_breakdown / n_failed * 100
+
+# Booking volume
+bookings_vehicle = df["Vehicle Type"].value_counts()
+
+
+# Status mix (in %) for any grouping column
+def status_share(col):
+    counts = (
+        df.groupby([col, "Booking Status"], observed=False)
+        .size()
+        .unstack(fill_value=0)
+    )
+    counts = counts[[s for s in STATUS_ORDER if s in counts.columns]]
+    return counts.div(counts.sum(axis=1), axis=0) * 100
+
+
+slot_share = status_share("time_category")
+vehicle_share = status_share("Vehicle Type").loc[bookings_vehicle.index]
+slot_fail = 100 - slot_share["Completed"]
+vehicle_fail = 100 - vehicle_share["Completed"]
+
+# Rates by pickup location (rate, not volume)
+loc_stats = df.groupby("Pickup Location").agg(
+    bookings=("is_failed", "size"),
+    fail_rate=("is_failed", "mean"),
+    ndf_rate=("is_ndf", "mean"),
+)
+loc_stats[["fail_rate", "ndf_rate"]] = loc_stats[["fail_rate", "ndf_rate"]] * 100
+loc_stats = loc_stats[loc_stats["bookings"] >= 100]
+loc_top_fail = loc_stats.sort_values("fail_rate", ascending=False).head(10)
+loc_top_ndf = loc_stats.sort_values("ndf_rate", ascending=False).head(10)
+
+# No Driver Found rate by time slot
+ndf_slot = slot_share["No Driver Found"] if "No Driver Found" in slot_share else None
+
+# Revenue
+rev_vehicle = (
+    completed.groupby("Vehicle Type")["Booking Value"].sum().sort_values(ascending=False)
+)
+rev_payment = completed.groupby("Payment Method")["Booking Value"].sum()
+rev_slot = completed.groupby("time_category", observed=False)["Booking Value"].sum()
+rev_month = completed.groupby("Month", observed=False)["Booking Value"].sum()
+
+# Cancellation reasons
+driver_cancel = (
+    df.groupby("Driver Cancellation Reason")["Cancelled Rides by Driver"]
+    .sum()
+    .sort_values(ascending=False)
+    .reset_index()
+)
+customer_cancel = (
+    df.groupby("Reason for cancelling by Customer")["Cancelled Rides by Customer"]
+    .sum()
+    .sort_values(ascending=False)
+    .reset_index()
+)
+incomplete_reason = (
+    df.groupby("Incomplete Rides Reason")["Incomplete Rides"]
+    .sum()
+    .sort_values(ascending=False)
+    .reset_index()
+)
+
+
+# Wait time by outcome (ignore 0 / missing values)
+wait_by_status = (
+    df[df["Avg VTAT"] > 0].groupby("Booking Status")["Avg VTAT"].mean()
+)
+
+#Hupothesis Calc
+
+#H1
+top_failure = fail_breakdown.idxmax()
+h1_result = (
+    f"{top_failure}: {fail_share[top_failure]:.0f}% "
+    f"of unsuccessful bookings"
+)
+
+# H2
+h2_result = (
+    f"Unsuccessful rate: {slot_fail.min():.1f}%–"
+    f"{slot_fail.max():.1f}% across time slots"
+)
+
+# H3
+h3_result = (
+    f"Unsuccessful rate: {vehicle_fail.min():.1f}%–"
+    f"{vehicle_fail.max():.1f}% across vehicle types"
+)
+
+# H4
+comp_wait = df[
+    (df["Booking Status"] == "Completed") &
+    (df["Avg VTAT"] > 0)
+]["Avg VTAT"]
+
+cust_wait = df[
+    (df["Booking Status"] == "Cancelled by Customer") &
+    (df["Avg VTAT"] > 0)
+]["Avg VTAT"]
+
+if len(comp_wait) > 0 and len(cust_wait) > 0:
+    h4_result = (
+        f"Avg wait: {cust_wait.mean():.1f} min "
+        f"(customer-cancelled) vs "
+        f"{comp_wait.mean():.1f} min (completed)"
+    )
+else:
+    h4_result = "Wait time not available for these outcomes"
+
+# ------------------------------------------------------------------ #
+# CHART HELPERS
+# ------------------------------------------------------------------ #
+def show(fig):
+    st.pyplot(fig)
+    plt.close(fig)
+
+
+def hbar(labels, values, title, colors, texts=None, figsize=(8, 4.5)):
+    fig, ax = plt.subplots(figsize=figsize)
+    values = list(values)
+    bars = ax.barh(list(labels), values, color=colors)
+    if texts is None:
+        texts = [f"{v:,.0f}" for v in values]
+    ax.bar_label(bars, labels=texts, padding=3, fontsize=9)
+    ax.invert_yaxis()
+    ax.set_xlim(0, max(values) * 1.2)
+    ax.set_title(title)
+    fig.tight_layout()
+    return fig
+
+
+def vbar(labels, values, title, color, money=False, rotate=0, ylabel=None):
+    fig, ax = plt.subplots(figsize=(8, 4.5))
+    ax.bar([str(l) for l in labels], list(values), color=color)
+    ax.set_title(title)
+    if money:
+        ax.yaxis.set_major_formatter(M_FMT)
+    if ylabel:
+        ax.set_ylabel(ylabel)
+    plt.setp(ax.get_xticklabels(), rotation=rotate)
+    fig.tight_layout()
+    return fig
+
+
+def stacked_pct(share_df, title, xlabel, rotate=0):
+    fig, ax = plt.subplots(figsize=(8, 4.5))
+    share_df.plot(
+        kind="bar", stacked=True, ax=ax,
+        color=[STATUS_COLORS.get(c, "grey") for c in share_df.columns]
+    )
+    for container in ax.containers:
+        ax.bar_label(container, fmt="%.1f%%", label_type="center", fontsize=7)
+    ax.set_title(title)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel("% of bookings")
+    ax.set_ylim(0, 100)
+    ax.legend(title="Booking Status", bbox_to_anchor=(1.02, 1), loc="upper left", fontsize=8)
+    plt.setp(ax.get_xticklabels(), rotation=rotate)
+    fig.tight_layout()
+    return fig
+
+
+# ------------------------------------------------------------------ #
+# NAVIGATION
+# ------------------------------------------------------------------ #
 st.sidebar.title("Navigation")
+st.sidebar.markdown(f"**Question**\n\n{BUSINESS_QUESTION}")
 
 page = st.sidebar.radio(
     "Go To",
     [
-        "Executive Summary",
-        "Revenue Analysis",
-        "Ride Analysis",
-        "Operational Insights"
-    ]
+        "Executive Overview",
+        "Unsuccessful Booking Analysis",
+        "Ride Fulfillment Analysis",
+        "Demand & Revenue",
+    ],
 )
 
-# KPI Calculations
+# ================================================================== #
+# PAGE 1 - EXECUTIVE OVERVIEW
+# ================================================================== #
+if page == "Executive Overview":
 
-total_bookings = len(df)
-completion_rate = (len(completed) / total_bookings) * 100
-total_revenue = completed["Booking Value"].sum()
-average_fare = completed["Booking Value"].mean()
-unique_customers = df["Customer ID"].nunique()
-average_driver_rating = completed["Driver Ratings"].mean()
-average_customer_rating = completed["Customer Rating"].mean()
-average_wait_time = df["Avg VTAT"].mean()
-average_distance = completed["Ride Distance"].mean()
-
-#Metrics for charts
-# Revenue by Vehicle
-revenue_vehicle = (
-    completed.groupby('Vehicle Type')['Booking Value']
-    .sum()
-    .sort_values(ascending=False)
-    .reset_index()
-)
-
-# Revenue by Payment Method
-rev_pay_method = (
-    completed.groupby('Payment Method')['Booking Value']
-    .sum()
-    .reset_index()
-)
-
-# Revenue by Time Slot
-times = ['Morning','Afternoon','Evening','Night']
-
-completed['time_category'] = pd.Categorical(
-    completed['time_category'],
-    categories=times,
-    ordered=True
-)
-
-rev_by_time_slot = (
-    completed.groupby('time_category')['Booking Value']
-    .sum()
-    .reset_index()
-)
-
-# Revenue by Pickup Location
-pickup_revenue = (
-    completed.groupby('Pickup Location')['Booking Value']
-    .sum()
-    .sort_values(ascending=False)
-    .head(10)
-    .reset_index()
-)
-# ---------------- Ride Analysis Data ---------------- #
-
-# Bookings by Vehicle Type
-bookings_vehicle = (
-    df.groupby('Vehicle Type')
-    .size()
-    .sort_values(ascending=False)
-    .reset_index(name='Bookings')
-)
-
-# Bookings by Month
-month_order = [
-    "January","February","March","April","May","June",
-    "July","August","September","October","November","December"
-]
-
-df["Month"] = pd.Categorical(
-    df["Month"],
-    categories=month_order,
-    ordered=True
-)
-
-bookings_month = (
-    df.groupby("Month")
-    .size()
-    .reset_index(name="Bookings")
-)
-
-# Bookings by Time Slot
-
-times = ['Morning', 'Afternoon', 'Evening', 'Night']
-
-df['time_category'] = pd.Categorical(
-    df['time_category'],
-    categories=times,
-    ordered=True
-)
-
-status_time = (
-    df.groupby(['time_category', 'Booking Status'])
-      .size()
-      .unstack(fill_value=0)
-)
-# Top Pickup Locations
-pickup_bookings = (
-    df.groupby('Pickup Location')
-    .size()
-    .sort_values(ascending=False)
-    .head(10)
-    .reset_index(name='Bookings')
-)
-
-# Driver cancellation reasons
-driver_cancel = (
-    df.groupby('Driver Cancellation Reason')['Cancelled Rides by Driver']
-    .sum()
-    .sort_values(ascending=False)
-    .reset_index()
-)
-
-# Customer cancellation reasons
-customer_cancel = (
-    df.groupby('Reason for cancelling by Customer')['Cancelled Rides by Customer']
-    .sum()
-    .sort_values(ascending=False)
-    .reset_index()
-)
-
-# Incomplete ride reasons
-incomplete_reason = (
-    df.groupby('Incomplete Rides Reason')['Incomplete Rides']
-    .sum()
-    .sort_values(ascending=False)
-    .reset_index()
-)
-status_vehicle = (
-    df.groupby(['Vehicle Type', 'Booking Status'])
-      .size()
-      .unstack(fill_value=0)
-)
-
-if page=="Executive Summary":
-
-    st.title("Executive Summary")
-    st.markdown(
-    """
-    This dashboard provides an overview of Uber ride operations,
-    revenue performance, customer experience, and operational efficiency.
-    """
+    st.title("Executive Overview")
+    st.info(
+        f"**Question:** {BUSINESS_QUESTION}\n\n"
+        f"**Headline:** {failure_rate:.0f}% of bookings ({n_failed:,} of {total_bookings:,}) "
+        f"were unsuccessful. {top_failure} were the largest cause."
     )
-# ---------- Row 1 ----------
 
-    col1, col2, col3, col4 = st.columns(4)
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Total Bookings", f"{total_bookings:,}")
+    c2.metric("Completed Bookings", f"{n_completed:,}")
+    c3.metric("Unsuccessful Rate", f"{failure_rate:.1f}%",
+              help=f"{n_failed:,} bookings were cancelled, unmatched or incomplete.")
+    c4.metric("Total Revenue", f"₹{total_revenue / 1_000_000:.1f} M",
+              help="Booking value of completed rides.")
+    c5.metric("Average Fare", f"₹{average_fare:.2f}")
 
-    with col1:
-        st.metric(
-            "Total Bookings",
-            f"{total_bookings:,}"
-        )
-
-    with col2:
-        st.metric(
-            "Total Revenue",
-            f"₹{total_revenue/1_000_000:.1f} M"
-        )
-
-    with col3:
-        st.metric(
-            "Completion Rate",
-            f"{completion_rate:.1f}%"
-        )
-
-    with col4:
-        st.metric(
-            "Unique Customers",
-            f"{unique_customers:,}"
-        )
-
-# ---------- Row 2 ----------
-
-    col5, col6, col7, col8 = st.columns(4)
-
-    with col5:
-        st.metric(
-            "Average Fare",
-            f"₹{average_fare:.2f}"
-        )
-
-    with col6:
-        st.metric(
-            "Driver Rating",
-            f"{average_driver_rating:.2f} ⭐"
-        )
-
-    with col7:
-        st.metric(
-            "Customer Rating",
-            f"{average_customer_rating:.2f} ⭐"
-        )
-
-    with col8:
-        st.metric(
-            "Average Wait Time",
-            f"{average_wait_time:.1f} min"
-        )
     st.markdown("---")
 
     col1, col2 = st.columns(2)
     with col1:
-
-        booking_status = df["Booking Status"].value_counts()
-
-        fig1, ax1 = plt.subplots(figsize=(5,5))
-
-        ax1.pie(
-            booking_status.values,
-            labels=booking_status.index,
-            autopct="%1.1f%%",
-            startangle=90
+        outcome = df["Booking Status"].value_counts()
+        outcome = outcome.reindex([s for s in STATUS_ORDER if s in outcome.index])
+        fig, ax = plt.subplots(figsize=(8, 4.5))
+        wedges, _, autotexts = ax.pie(
+            outcome.values,
+            colors=[STATUS_COLORS.get(s, "grey") for s in outcome.index],
+            autopct="%1.0f%%",
+            pctdistance=0.8,
+            startangle=90,
+            counterclock=False,
+            wedgeprops=dict(width=0.45, edgecolor="white"),
+            textprops=dict(color="white", fontsize=9),
         )
-
-        ax1.set_title("Booking Status Distribution")
-
-        st.pyplot(fig1)
-
+        ax.text(0, 0, f"{failure_rate:.0f}%\nunsuccessful", ha="center", va="center",
+                fontsize=13, fontweight="bold")
+        ax.legend(wedges, outcome.index, loc="center left", bbox_to_anchor=(1.0, 0.5))
+        ax.set_title("Booking Outcome Distribution")
+        fig.tight_layout()
+        show(fig)
     with col2:
+        fig, ax = plt.subplots(figsize=(8, 4.5))
+        ax.plot(rev_month.index.astype(str), rev_month.values, marker="o", linewidth=2)
+        ax.set_ylim(0, rev_month.max() * 1.2)
+        ax.set_ylabel("Revenue (₹)")
+        ax.yaxis.set_major_formatter(M_FMT)
+        ax.set_title("Monthly Revenue")
+        plt.setp(ax.get_xticklabels(), rotation=45)
+        fig.tight_layout()
+        show(fig)
 
-        rev_monthly = (
-            completed.groupby("Month")["Booking Value"]
-            .sum()
-            .reindex([
-                "January","February","March","April",
-                "May","June","July","August",
-                "September","October","November","December"
-            ])
+    st.markdown("---")
+    st.subheader("Hypotheses Tested")
+    hypotheses = [
+    ["H1", "Which booking outcome accounts for the largest share of unsuccessful bookings?", h1_result],
+    ["H2", "How does unsuccessful rate vary across time slots?", h2_result],
+    ["H3", "Do failure rates differ across vehicle types?", h3_result],
+    ["H4", "How do wait times compare across booking outcomes?", h4_result],
+    ]
+
+    st.table(
+        pd.DataFrame(
+            hypotheses,
+            columns=["#", "Question", "Finding"]
         )
-
-        fig2, ax2 = plt.subplots(figsize=(8,5))
-
-        ax2.plot(
-            rev_monthly.index,
-            rev_monthly.values,
-            marker="o",
-            linewidth=2
-        )
-
-        ax2.set_title("Monthly Revenue")
-
-        ax2.set_xlabel("Month")
-
-        ax2.set_ylabel("Revenue (₹)")
-
-        ax2.tick_params(axis="x", rotation=45)
-
-        ax2.yaxis.set_major_formatter(
-            FuncFormatter(
-                lambda x,pos:f"{x/1_000_000:.1f} M"
-            )
-        )
-
-        st.pyplot(fig2)
-
-elif page=="Revenue Analysis":
-
-    st.title("💰 Revenue Analysis")
-    col1,col2 = st.columns(2)
-    with col1:
-
-        fig,ax=plt.subplots(figsize=(8,5))
-
-        ax.bar(
-            revenue_vehicle['Vehicle Type'],
-            revenue_vehicle['Booking Value']
-        )
-
-        ax.set_title("Revenue by Vehicle Type")
-
-        ax.yaxis.set_major_formatter(
-            FuncFormatter(
-                lambda x,pos:f"{x/1_000_000:.1f} M"
-            )
-        )
-
-        plt.xticks(rotation=30)
-
-        st.pyplot(fig)
-
-    with col2:
-
-        fig,ax=plt.subplots(figsize=(8,5))
-
-        ax.bar(
-            rev_pay_method['Payment Method'],
-            rev_pay_method['Booking Value'],
-            color="green"
-        )
-
-        ax.set_title("Revenue by Payment Method")
-    
-        ax.yaxis.set_major_formatter(
-            FuncFormatter(
-                lambda x,pos:f"{x/1_000_000:.1f} M"
-            )
-        )
-
-        plt.xticks(rotation=30)
-
-        st.pyplot(fig)
-
-    col3,col4 = st.columns(2)
-    with col3:
-
-        fig,ax=plt.subplots(figsize=(8,5))
-
-        ax.bar(
-            rev_by_time_slot['time_category'],
-            rev_by_time_slot['Booking Value'],
-            color="orange"
-        )
-
-        ax.set_title("Revenue by Time Slot")
-
-        ax.yaxis.set_major_formatter(
-            FuncFormatter(
-                lambda x,pos:f"{x/1_000_000:.1f} M"
-            )
-        )
-
-        st.pyplot(fig)
-    with col4:
-
-        fig,ax=plt.subplots(figsize=(8,5))
-
-        bars=ax.barh(
-            pickup_revenue['Pickup Location'],
-            pickup_revenue['Booking Value'],
-            color="skyblue"
-        )
-
-        for bar in bars:
-
-            width=bar.get_width()
-
-            ax.text(
-                width+20,
-                bar.get_y()+bar.get_height()/2,
-                f"{int(width):,}",
-                va="center",
-                fontsize=9
-            )
-
-        ax.invert_yaxis()
-
-        ax.set_title("Top 10 Pickup Locations by Revenue")
-
-        ax.xaxis.set_major_formatter(
-            FuncFormatter(
-                lambda x,pos:f"₹{x:,.0f}"
-            )
-        )
-
-        st.pyplot(fig,use_container_width=True)
-
-elif page == "Ride Analysis":
-
-    st.title("🚖 Ride Analysis")
-
-    st.markdown(
-        "Analyze ride demand across vehicles, months, time slots and pickup locations."
     )
+    
+# ================================================================== #
+# PAGE 2 - UNSUCCESSFUL BOOKING ANALYSIS : why?
+# ================================================================== #
+elif page == "Unsuccessful Booking Analysis":
+
+    st.title("Unsuccessful Booking Analysis")
+    st.markdown("**Why are bookings unsuccessful?**")
+
     col1, col2 = st.columns(2)
     with col1:
-
-        fig, ax = plt.subplots(figsize=(8,5))
-
-        ax.bar(
-            bookings_vehicle['Vehicle Type'],
-            bookings_vehicle['Bookings'],
-            color='royalblue'
-        )
-
-        ax.set_title("Bookings by Vehicle Type")
-        ax.set_xlabel("Vehicle Type")
-        ax.set_ylabel("Bookings")
-
-        plt.xticks(rotation=30)
-
-        st.pyplot(fig,use_container_width=True)
+        texts = [f"{n:,} ({fail_share[s]:.0f}%)" for s, n in fail_breakdown.items()]
+        show(hbar(
+            fail_breakdown.index, fail_breakdown.values,
+            "Unsuccessful Bookings by Type",
+            [STATUS_COLORS.get(s, "grey") for s in fail_breakdown.index],
+            texts=texts,
+        ))
+       
     with col2:
+        show(hbar(driver_cancel["Driver Cancellation Reason"],
+                  driver_cancel["Cancelled Rides by Driver"],
+                  "Why Do Drivers Cancel?", "tomato"))
 
-        fig, ax = plt.subplots(figsize=(8,5))
-
-        ax.plot(
-            bookings_month['Month'],
-            bookings_month['Bookings'],
-            marker='o',
-            linewidth=2
-        )
-
-        ax.set_title("Bookings by Month")
-        ax.set_xlabel("Month")
-        ax.set_ylabel("Bookings")
-
-        plt.xticks(rotation=45)
-
-        st.pyplot(fig) 
-        
     col3, col4 = st.columns(2)
     with col3:
-
-        # Booking Status by Time Slot
-
-        fig, ax = plt.subplots(figsize=(8,5))
-
-        status_time.plot(
-            kind='bar',
-            stacked=True,
-            ax=ax
-        )
-
-        ax.set_title("Booking Status by Time Slot")
-        ax.set_xlabel("Time Slot")
-        ax.set_ylabel("Number of Bookings")
-
-        ax.tick_params(axis='x', rotation=0)
-
-        ax.legend(
-            title="Booking Status",
-            bbox_to_anchor=(1.02, 1),
-            loc="upper left"
-        )
-
-        # Show values inside each stack
-        for container in ax.containers:
-            ax.bar_label(
-            container,
-            label_type="center",
-            fontsize=8
-        )
-
-        fig.tight_layout()
-
-        st.pyplot(fig, use_container_width=True)
+        show(hbar(customer_cancel["Reason for cancelling by Customer"],
+                  customer_cancel["Cancelled Rides by Customer"],
+                  "Why Do Customers Cancel?", "royalblue"))
     with col4:
+        show(hbar(incomplete_reason["Incomplete Rides Reason"],
+                  incomplete_reason["Incomplete Rides"],
+                  "Why Do Rides End Up Incomplete?", "green"))
 
-        fig, ax = plt.subplots(figsize=(8,5))
+    ndf = fail_breakdown.get("No Driver Found", 0)
+    st.info(
+        f"**No Driver Found:** {ndf:,} bookings ({ndf / total_bookings * 100:.0f}% of all "
+        f"bookings) were not matched with a driver. The dataset has no reason field for these, "
+        f"so they are examined by time and location on the next page."
+    )
 
-        bars = ax.barh(
-            pickup_bookings['Pickup Location'],
-            pickup_bookings['Bookings'],
-            color='orange'
-        )
+# ================================================================== #
+# PAGE 3 - RIDE FULFILLMENT ANALYSIS : where and when?
+# ================================================================== #
+elif page == "Ride Fulfillment Analysis":
 
-        for bar in bars:
+    st.title("Ride Fulfillment Analysis")
+    st.markdown("**Where and when are bookings more likely to succeed or be unsuccessful?**")
 
-            width = bar.get_width()
-
-            ax.text(
-                width + 5,
-                bar.get_y() + bar.get_height()/2,
-                f"{int(width):,}",
-                va="center",
-                fontsize=9
-            )
-
-        ax.set_title("Top 10 Pickup Locations")
-        ax.set_xlabel("Bookings")
-
-        ax.invert_yaxis()
-
-        st.pyplot(fig)
-
-elif page=="Operational Insights":
-
-    st.title("⚙️ Operational Insights")
-    col1,col2 = st.columns(2)
+    col1, col2 = st.columns(2)
     with col1:
-
-        fig,ax=plt.subplots(figsize=(8,5))
-
-        bars=ax.barh(
-            driver_cancel['Driver Cancellation Reason'],
-            driver_cancel['Cancelled Rides by Driver'],
-            color='tomato'
+        show(stacked_pct(vehicle_share, "Booking Outcome by Vehicle Type",
+                         "Vehicle Type", rotate=30))
+        st.caption(
+            f"Failure rate ranges {vehicle_fail.min():.1f}%–{vehicle_fail.max():.1f}% "
+            f"across vehicle types."
         )
-
-        for bar in bars:
-
-            width=bar.get_width()
-
-            ax.text(
-                width+5,
-                bar.get_y()+bar.get_height()/2,
-                f"{int(width):,}",
-                va="center",
-                fontsize=9
-            )
-
-        ax.invert_yaxis()
-
-        ax.set_title("Driver Cancellation Reasons")
-
-        st.pyplot(fig)
     with col2:
-
-        fig,ax=plt.subplots(figsize=(8,5))
-
-        bars=ax.barh(
-            customer_cancel['Reason for cancelling by Customer'],
-            customer_cancel['Cancelled Rides by Customer'],
-            color='royalblue'
+        show(stacked_pct(slot_share, "Booking Outcome by Time Slot", "Time Slot"))
+        st.caption(
+            f"Failure rates are similar across time slots ranging from"
+            f"({slot_fail.min():.1f}%–{slot_fail.max():.1f}%), despite higher booking "
         )
 
-        for bar in bars:
-
-            width=bar.get_width()
-
-            ax.text(
-                width+5,
-                bar.get_y()+bar.get_height()/2,
-                f"{int(width):,}",
-                va="center",
-                fontsize=9
-            )
-
-        ax.invert_yaxis()
-
-        ax.set_title("Customer Cancellation Reasons")
-
-        st.pyplot(fig)
-    col3,col4 = st.columns(2)
+    col3, col4 = st.columns(2)
     with col3:
-        
-        
-
-        fig,ax=plt.subplots(figsize=(9,5))
-
-        bars=ax.barh(
-            incomplete_reason['Incomplete Rides Reason'],
-            incomplete_reason['Incomplete Rides'],
-            color='green'
+        if len(loc_stats) > 0:
+            show(hbar(loc_top_fail.index, loc_top_fail["fail_rate"].values,
+                      "Pickup Locations with Highest Unsuccessful Rate", "#9467bd",
+                      texts=[f"{r:.1f}%  (n={int(n):,})"
+                             for r, n in zip(loc_top_fail["fail_rate"],
+                                             loc_top_fail["bookings"])]))
+            st.caption(
+                f"Locations with 100+ bookings only are included."
+            )
+    with col4:
+        show(hbar(wait_by_status.index, wait_by_status.values,
+                  "Average Wait Time by Booking Outcome (min)",
+                  [STATUS_COLORS.get(s, "grey") for s in wait_by_status.index],
+                  texts=[f"{v:.1f}" for v in wait_by_status.values]))
+        st.caption(
+            "Wait time = time for the driver to reach the pickup point. "
+            "No Driver Found has none because no driver was assigned."
         )
 
-        for bar in bars:
-
-            width=bar.get_width()
-
-            ax.text(
-                width+5,
-                bar.get_y()+bar.get_height()/2,
-                f"{int(width):,}",
-                va="center"
+    col5, col6 = st.columns(2)
+    with col5:
+        if ndf_slot is not None:
+            show(vbar(ndf_slot.index, ndf_slot.values,
+                      "No Driver Found Rate by Time Slot (% of bookings)", "#9467bd",
+                      ylabel="% of bookings"))
+            st.caption(
+                f"No Driver Found accounts for about {ndf_slot.min():.1f}% of bookings in each time slot."
+                
+            )
+    with col6:
+        if len(loc_stats) > 0:
+            show(hbar(loc_top_ndf.index, loc_top_ndf["ndf_rate"].values,
+                      "Pickup Locations with Highest No Driver Found Rate", "#9467bd",
+                      texts=[f"{r:.1f}%  (n={int(n):,})"
+                             for r, n in zip(loc_top_ndf["ndf_rate"],
+                                             loc_top_ndf["bookings"])]))
+            st.caption(
+                f"Locations with 100+ bookings only."
             )
 
-        ax.invert_yaxis()
+# ================================================================== #
+# PAGE 4 - DEMAND & REVENUE
+# ================================================================== #
+elif page == "Demand & Revenue":
 
-        ax.set_title("Incomplete Ride Reasons")
+    st.title("Demand & Revenue")
+    st.markdown("**Where are demand and booking value concenterated?**")
 
-        st.pyplot(fig)
-    with col4:
-        fig, ax = plt.subplots(figsize=(10,6))
+    col1, col2 = st.columns(2)
+    with col1:
+        show(vbar(rev_vehicle.index, rev_vehicle.values, "Revenue by Vehicle Type",
+                  "#1f77b4", money=True, rotate=30))
+    with col2:
+        show(vbar(rev_slot.index, rev_slot.values, "Revenue by Time Slot",
+                  "orange", money=True))
 
-        status_vehicle.plot(
-            kind='bar',
-            stacked=True,
-            ax=ax
-        )
+    col3, _ = st.columns(2)
+    with col3:
+        show(vbar(rev_payment.index, rev_payment.values, "Revenue by Payment Method",
+                  "green", money=True, rotate=30))
 
-        ax.set_title("Booking Status by Vehicle Type")
-        ax.set_xlabel("Vehicle Type")
-        ax.set_ylabel("Number of Bookings")
-        plt.xticks(rotation=30)
-        plt.legend(title="Booking Status", bbox_to_anchor=(1.02,1), loc="upper left")
-
-        st.pyplot(fig)
+    #st.caption(
+     #   "Revenue is the booking value of completed rides. Payment method is recorded only "
+     #   "for completed and incomplete rides."
+    #)
     
-    st.markdown("---")
-    st.header("📌 Key Insights & Recommendations")
 
-    st.markdown("""
-    ### 1. UPI is the most preferred payment method among customers. Ensuring a seamless digital payment experience and promoting UPI-based offers can further improve customer convenience.
-
-    ### 2. Auto is the most preferred vehicle type and generates the highest overall revenue, whereas Uber XL receives the lowest number of bookings.
-    ### 3. Morning (5am to 12pm) and Evening (5pm to 9pm) rides are peak demand period.
-    ### 4. Driver cancellations are the primary operational challenge. This suggests the need for better driver training, performance-based incentives, and improved communication between drivers and customers.
-    ### 5. No Driver found indicates the supply shortage that is demand is more than supply and these can be resolved by increasing active drivers during peak hours.
-""")
-
-    st.markdown("---")
-
+# ------------------------------------------------------------------ #
+# FOOTER
+# ------------------------------------------------------------------ #
 st.markdown(
     """
     <style>
@@ -627,4 +475,3 @@ st.markdown(
     """,
     unsafe_allow_html=True
 )
-  
